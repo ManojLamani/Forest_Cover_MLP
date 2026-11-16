@@ -1,0 +1,17 @@
+# Dataset: downloaded automatically by scikit-learn on the first run
+data/
+
+# Per-experiment checkpoints used only to speed up re-runs of the notebook
+results/cache/
+
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
