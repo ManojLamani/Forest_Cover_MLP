@@ -8,6 +8,9 @@ results/cache/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+.venv/
+venv/
+predictions.csv
 
 # OS / editor
 .DS_Store
