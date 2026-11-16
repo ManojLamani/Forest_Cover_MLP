@@ -11,8 +11,9 @@
 # | Model-selection metric | **Macro F1-score on the validation set** (the classes are heavily imbalanced) |
 #
 # ### Setup / how to run
-# 1. Install Python 3.10+ and the packages: `pip install -r requirements.txt`
-# 2. Start Jupyter in this folder: `jupyter notebook` (or open the file in VS Code) and open `covertype_mlp.ipynb`.
+# 1. Install Python 3.10+ and the packages: `python -m pip install -r requirements.txt`.
+#    README.md provides Windows virtual-environment instructions and the verified Python version.
+# 2. Start Jupyter in this folder: `python -m notebook covertype_mlp.ipynb` (or open the file in VS Code).
 # 3. Run all cells (*Kernel > Restart & Run All*). The dataset (about 11 MB) is downloaded automatically by
 #    scikit-learn into `./data/` on the first run.
 # 4. Outputs are written to `./figures/` (plots), `./results/` (experiment tables) and `./models/` (final model).
@@ -26,7 +27,7 @@
 # 3. Data preprocessing (cleaning, encoding, outliers, splitting, scaling, class imbalance)
 # 4. MLP model, training loop and evaluation helpers
 # 5. Baseline model
-# 6. Fine-tuning experiments (controlled, one factor at a time)
+# 6. Fine-tuning experiments (controlled groups with explicit configuration changes)
 # 7. Final model: early stopping and longer training
 # 8. Final evaluation on the held-out test set
 # 9. Experiment comparison, conclusions, limitations and future work
@@ -48,6 +49,7 @@ import numpy as np             # numerical arrays
 import pandas as pd            # tables / data frames
 import matplotlib.pyplot as plt  # all plots
 from IPython.display import display  # show tables nicely in the notebook
+from forest_cover import MLP, engineer_features, fit_training_medians, impute_continuous
 
 import torch                   # deep learning framework
 import torch.nn as nn          # layers, activations, loss functions
@@ -231,13 +233,25 @@ ax.set_title("Correlation matrix of continuous features")
 plt.tight_layout(); plt.savefig("figures/eda_correlation.png"); plt.show()
 
 # %% [markdown]
-# OBS_EDA
+# ### EDA observations
+# The data contains 581,012 rows, 54 inputs and one target, with no missing values, exact duplicates, or
+# identical feature rows carrying conflicting labels. Lodgepole Pine (48.76%) and Spruce/Fir (36.46%) together
+# account for 85.22% of records; Cottonwood/Willow is only 0.47%, giving an imbalance ratio of about 103:1.
+# Accuracy alone could hide failures on minority species, so validation macro F1 drives model selection.
+# Elevation ranges from 1,859 to 3,858 m and differs across species in the class-wise boxplots. Several distance
+# features have long right tails, whereas the hillshade measurements have a bounded physical range.
+# Continuous features therefore need scaling, and extreme distances are clipped rather than deleted.
+# Aspect is circular: 0 and 360 degrees represent the same direction, motivating sine/cosine features.
+# Negative vertical distance to water is valid (the cell can be below the water source).
+# The target is nominal: Pearson correlation with numeric cover-type IDs is only a rough visualization,
+# not evidence of an ordered target or a reason to select/drop a feature.
 
 # %% [markdown]
 # ## 3. Data preprocessing
 # ### 3.1 Missing values, duplicates and inconsistent data
-# * **Missing values:** checked above. If any were present, numeric columns would be filled with the
-#   *training-set* median (never the full-data median, to avoid leakage).
+# * **Missing values:** there are none in the supplied dataset. If continuous measurements were missing,
+#   they would stay missing through feature engineering and be filled using medians fitted after splitting
+#   in section 3.3. Invalid or missing categorical indicators are rejected rather than median-imputed.
 # * **Duplicates:** exact duplicate rows add no information and would let the same record appear in both the
 #   training and test set, so they are dropped.
 # * **Consistency rules** derived from the dataset documentation are checked: each record must belong to exactly
@@ -247,9 +261,7 @@ plt.tight_layout(); plt.savefig("figures/eda_correlation.png"); plt.show()
 # %%
 n_before = len(df)
 
-# Missing values: fill with the median if any exist (none in this dataset)
-if df.isna().any().any():
-    df = df.fillna(df.median(numeric_only=True))
+# Keep continuous NaNs until the training split is available; never fit an imputer on the full dataset.
 
 # Exact duplicate rows
 df = df.drop_duplicates().reset_index(drop=True)
@@ -266,9 +278,10 @@ checks = {
 }
 display(pd.DataFrame({"violations": checks}))
 
-# Fixes: 360 degrees is the same direction as 0 degrees; rows with an invalid one-hot group would be dropped
-df["Aspect"] = df["Aspect"] % 360
-valid = (df[WILD_COLS].sum(axis=1) == 1) & (df[SOIL_COLS].sum(axis=1) == 1)
+# Drop invalid categorical rows. The feature helper below maps valid 360-degree aspect to 0 and rejects
+# other invalid physical ranges; continuous NaNs remain for train-only imputation.
+valid = (df[WILD_COLS + SOIL_COLS].isin([0, 1]).all(axis=1)
+         & (df[WILD_COLS].sum(axis=1) == 1) & (df[SOIL_COLS].sum(axis=1) == 1))
 df = df[valid].reset_index(drop=True)
 
 # Binary columns stored as small integers
@@ -289,11 +302,9 @@ print(f"Rows before cleaning: {n_before:,} | after cleaning: {len(df):,}")
 #   indices starting at 0.
 
 # %%
-aspect_rad = np.deg2rad(df["Aspect"])
-df["Aspect_sin"] = np.sin(aspect_rad)
-df["Aspect_cos"] = np.cos(aspect_rad)
-df["Euclid_Distance_To_Hydrology"] = np.sqrt(df["Horizontal_Distance_To_Hydrology"] ** 2 +
-                                             df["Vertical_Distance_To_Hydrology"] ** 2)
+# The shared helper validates physical ranges and creates Aspect_sin, Aspect_cos, and Euclidean distance.
+# Inference calls the same helper, so feature names, formulas, and ordering stay consistent.
+df = engineer_features(df)
 
 CONT_COLS = [c for c in CONT_RAW if c != "Aspect"] + ["Aspect_sin", "Aspect_cos", "Euclid_Distance_To_Hydrology"]
 BIN_COLS = WILD_COLS + SOIL_COLS
@@ -317,7 +328,7 @@ print(f"Input features: {N_FEATURES} ({len(CONT_COLS)} continuous + {len(BIN_COL
 # the rare Cottonwood/Willow class (0.5% of the data).
 #
 # **Leakage prevention:** the data is split *before* any statistic is computed. The outlier clipping limits, the
-# mean and standard deviation of the scaler and the class weights are all computed on the training set only and
+# imputation medians, mean and standard deviation of the scaler and class weights are computed on training only and
 # then applied unchanged to validation and test, so no information from validation/test leaks into training.
 
 # %%
@@ -325,6 +336,11 @@ X_train_df, X_temp_df, y_train, y_temp = train_test_split(
     X_all, y_all, test_size=0.30, stratify=y_all, random_state=SEED)
 X_val_df, X_test_df, y_val, y_test = train_test_split(
     X_temp_df, y_temp, test_size=0.50, stratify=y_temp, random_state=SEED)
+
+TRAIN_MEDIANS = fit_training_medians(X_train_df, CONT_COLS)
+X_train_df, X_val_df, X_test_df = (
+    impute_continuous(frame, TRAIN_MEDIANS) for frame in (X_train_df, X_val_df, X_test_df)
+)
 
 split_table = pd.DataFrame({
     "records": [len(y_train), len(y_val), len(y_test)],
@@ -437,63 +453,13 @@ pd.DataFrame({"train share %": np.bincount(y_train) / len(y_train) * 100,
 # * **Xavier / Glorot uniform**: variance `2 / (fan_in + fan_out)`, designed for tanh/sigmoid.
 # * **Small normal N(0, 0.01)**: a naive choice, included to show why principled initialisation matters.
 # * **PyTorch default** (Kaiming-uniform with a=sqrt(5)).
-# Biases start at zero.
+# Biases start at zero for the explicit He, Xavier and small-normal schemes. The default option retains
+# PyTorch's built-in bias initialization as well as its weight initialization.
 
 # %%
-# Map activation names (used in experiment configs) to PyTorch layer constructors
-ACTIVATIONS = {
-    "relu": nn.ReLU,                               # max(0, z): cheap, no saturation for z > 0
-    "leaky_relu": lambda: nn.LeakyReLU(0.01),      # small slope for z < 0 -> no "dead" neurons
-    "elu": nn.ELU,                                 # smooth negative part, mean activation closer to 0
-    "gelu": nn.GELU,                               # smooth ReLU used in modern networks
-    "tanh": nn.Tanh,                               # zero-centred but saturates for large |z|
-}
-
-
-class MLP(nn.Module):
-    """Configurable multilayer perceptron for tabular classification.
-
-    n_in       : number of input features (56)
-    n_out      : number of classes (7) -> output logits
-    hidden     : tuple with the number of neurons of each hidden layer, e.g. (64, 32)
-    activation : key of ACTIVATIONS
-    dropout    : dropout probability after each hidden activation (0 = off)
-    batch_norm : add BatchNorm1d after each hidden Linear layer
-    init       : weight initialisation scheme: 'he', 'xavier', 'normal' or 'default'
-    """
-
-    def __init__(self, n_in, n_out, hidden=(64, 32), activation="relu", dropout=0.0,
-                 batch_norm=False, init="he"):
-        super().__init__()
-        layers, prev = [], n_in
-        for width in hidden:
-            layers.append(nn.Linear(prev, width))          # z = W x + b
-            if batch_norm:
-                layers.append(nn.BatchNorm1d(width))       # normalise z over the mini-batch
-            layers.append(ACTIVATIONS[activation]())       # a = f(z)
-            if dropout > 0:
-                layers.append(nn.Dropout(dropout))         # randomly zero activations while training
-            prev = width
-        layers.append(nn.Linear(prev, n_out))              # output layer: 7 logits (softmax is in the loss)
-        self.net = nn.Sequential(*layers)
-        self._init_weights(init)
-
-    def _init_weights(self, init):
-        if init == "default":
-            return                                          # keep PyTorch's built-in initialisation
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                if init == "he":
-                    nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
-                elif init == "xavier":
-                    nn.init.xavier_uniform_(m.weight)
-                elif init == "normal":
-                    nn.init.normal_(m.weight, mean=0.0, std=0.01)
-                nn.init.zeros_(m.bias)
-
-    def forward(self, x):
-        return self.net(x)                                  # forward propagation through all layers
-
+# MLP is imported from forest_cover.py; training and inference share its layer order and initialization.
+# Hidden blocks: Linear -> optional BatchNorm -> activation -> optional Dropout.
+# Its forward method passes inputs through those blocks and returns the seven output logits.
 
 # Quick look at the baseline architecture and its number of trainable parameters
 _demo = MLP(N_FEATURES, N_CLASSES, hidden=(64, 32))
@@ -576,7 +542,7 @@ LOG_FILE = "results/training_log.txt"   # one line per epoch of every run (handy
 
 
 def as_tensor(a):
-    """NumPy array -> PyTorch tensor without copying (the parallel workers share one memory-mapped copy)."""
+    """NumPy array -> PyTorch tensor without an extra copy within this worker process."""
     return torch.from_numpy(np.asarray(a))
 
 
@@ -730,16 +696,26 @@ baseline_train = evaluate(baseline_model, X_train, y_train)
 pd.DataFrame({"train": baseline_train, "validation": baseline_val}).T.round(4)
 
 # %% [markdown]
-# OBS_BASELINE
+# ### Baseline observations
+# The baseline obtains training accuracy 75.77% / macro F1 0.5181 and validation accuracy 75.81% /
+# macro F1 0.5122. Its training and validation losses are close (0.5710 and 0.5726), with essentially no
+# accuracy gap. This is consistent with underfitting at this architecture, optimizer, and 20-epoch budget,
+# rather than severe overfitting. The much lower macro F1 than accuracy shows weak minority-class coverage.
+# These validation results motivate testing optimizers, activation functions and capacity before adding
+# regularization. The test set is not consulted to choose the next experiment.
 
 # %% [markdown]
 # ## 6. Fine-tuning experiments
 #
-# ### 6.1 Method: controlled, one-factor-at-a-time search
-# The experiments are run in **groups**. Inside a group only one aspect of the model is changed
-# (optimizer, activation, architecture, ...), and all other settings, the seed, the data split, the initial
-# weights and the order of the mini-batches are identical. Any difference in validation performance is
-# therefore caused by that one change.
+# ### 6.1 Method: controlled groups and explicit configuration comparisons
+# Each candidate starts from the same reference within its group, with every changed configuration key
+# recorded in the comparison table. Many comparisons isolate one setting; some deliberately compare a
+# bundle: optimizer plus a suitable learning rate (A), AdamW plus weight decay (A), one-cycle plus its
+# maximum learning rate (E), and BatchNorm plus Dropout (G). These bundled results do not isolate the causal
+# effect of a single technique. Architecture candidates also change width/depth together.
+# The split and random seed are fixed. Matching architecture/initialization gives matching initial weights,
+# but changes to architecture, initialization, batch size or Dropout can change random-number consumption
+# and subsequent shuffling. Equal seeds improve comparability; they do not guarantee identical batch order.
 #
 # After each group, the configuration with the best **validation macro F1** becomes the reference for the next
 # group, but only if it beats the current reference; otherwise the reference stays unchanged. This greedy
@@ -758,8 +734,10 @@ pd.DataFrame({"train": baseline_train, "validation": baseline_val}).T.round(4)
 # | H Class imbalance | balanced and square-root class weights | improve the rare classes |
 # | I Early stopping | 60 epochs with vs. without early stopping | final training length and overfitting control |
 #
-# Each group's runs are executed in parallel (one CPU core each), which gives exactly the same results as
-# running them one after another.
+# Each group's runs execute in separate worker processes (one CPU thread per worker). Runtime depends on
+# hardware and concurrent load. Numerical reproducibility across library versions/hardware is not guaranteed.
+# All conclusions below describe the committed seed-42 run; plausible mechanisms are interpretations, not
+# proof of causality. Repeated seeds would be needed to establish whether small differences are robust.
 
 # %%
 N_JOBS = max(1, min(4, (os.cpu_count() or 2) - 2))   # parallel training processes (one CPU core each)
@@ -776,15 +754,23 @@ USE_CACHE = True              # set to False to retrain every experiment from sc
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 
-def run_experiment(name, group, changes, base_cfg, data):
-    """Train one configuration (base_cfg updated with `changes`) and collect train/validation metrics.
-    If the same experiment (same name and identical configuration) was already trained, load it from the cache."""
-    cfg = {**base_cfg, **changes}
+def load_cached_experiment(name, cfg):
+    """Return a matching cached result, or None when this configuration needs training."""
     cache_path = os.path.join(CACHE_DIR, f"{name}.pt")
     if USE_CACHE and os.path.exists(cache_path):
         saved = torch.load(cache_path, weights_only=False)
         if saved["cfg"] == cfg:
             return saved["row"], saved["hist"], saved["cfg"], saved["state"]
+    return None
+
+
+def run_experiment(name, group, changes, base_cfg, data):
+    """Train one configuration and collect metrics, reusing a matching cache when available."""
+    cfg = {**base_cfg, **changes}
+    cached = load_cached_experiment(name, cfg)
+    if cached is not None:
+        return cached
+    cache_path = os.path.join(CACHE_DIR, f"{name}.pt")
 
     model, hist, info = train_model(cfg, data, run_name=name)
     tr = evaluate(model, data["X_train"], data["y_train"])
@@ -805,6 +791,24 @@ def run_experiment(name, group, changes, base_cfg, data):
     return row, hist, cfg, state
 
 
+def run_candidates(group, candidates, base_cfg, n_jobs):
+    """Load caches in the parent; dispatch only unfinished experiments to worker processes."""
+    completed, pending = {}, []
+    for name, changes in candidates:
+        cached = load_cached_experiment(name, {**base_cfg, **changes})
+        if cached is None:
+            pending.append((name, changes))
+        else:
+            completed[name] = cached
+    if pending:
+        # Disable automatic memmapping to avoid Windows resource-tracker cleanup errors.
+        # Each worker gets its own data copy; reduce N_JOBS when memory is limited.
+        trained = Parallel(n_jobs=n_jobs, backend="loky", max_nbytes=None)(
+            delayed(run_experiment)(name, group, changes, base_cfg, DATA) for name, changes in pending)
+        completed.update((name, output) for (name, _), output in zip(pending, trained))
+    return [completed[name] for name, _ in candidates]
+
+
 SHOW_COLS = ["exp", "change", "epochs_run", "train_time_s", "train_acc", "val_acc",
              "val_precision_macro", "val_recall_macro", "val_f1_macro", "val_roc_auc", "overfit_gap_acc"]
 
@@ -812,8 +816,7 @@ SHOW_COLS = ["exp", "change", "epochs_run", "train_time_s", "train_acc", "val_ac
 def run_group(group, candidates, ref_cfg, ref_name):
     """Run all candidates of a group in parallel, show a comparison, and return the new reference."""
     t0 = time.time()
-    outs = Parallel(n_jobs=N_JOBS, backend="loky")(
-        delayed(run_experiment)(name, group, changes, ref_cfg, DATA) for name, changes in candidates)
+    outs = run_candidates(group, candidates, ref_cfg, N_JOBS)
     for row, hist, cfg, _ in outs:
         RESULTS.append(row); HISTORIES[row["exp"]] = hist; CONFIGS[row["exp"]] = cfg
 
@@ -860,7 +863,11 @@ ref_cfg, ref_name = run_group("A Optimizer", [
 ], ref_cfg, ref_name)
 
 # %% [markdown]
-# OBS_A
+# **Group A observations.** Validation macro F1 improves from 0.5122 (plain SGD) to 0.6843 with momentum,
+# 0.7393 with RMSprop, 0.7447 with Adam, and 0.7438 with AdamW. Adam at 0.001 becomes the next reference.
+# Adaptive updates plausibly help this network converge faster within 20 epochs. The optimizer/learning-rate
+# bundles are being compared, so the gain cannot be attributed to the optimizer alone. AdamW's additional
+# weight decay does not improve this run, and its 0.0009 F1 difference from Adam is too small for a general claim.
 
 # %% [markdown]
 # ### 6.3 Group B: activation function
@@ -874,7 +881,10 @@ ref_cfg, ref_name = run_group("B Activation", [
 ], ref_cfg, ref_name)
 
 # %% [markdown]
-# OBS_B
+# **Group B observations.** Tanh gives validation macro F1 0.7693 versus ReLU's 0.7447, GELU's 0.7633,
+# LeakyReLU's 0.7398 and ELU's 0.7077. Tanh is selected for the next group. Its bounded, zero-centered output
+# may suit these standardized tabular inputs, but this result is conditional on the small architecture,
+# He initialization and optimizer used here. It does not establish that tanh is universally best.
 
 # %% [markdown]
 # ### 6.4 Group C: number of hidden layers and neurons
@@ -888,7 +898,11 @@ ref_cfg, ref_name = run_group("C Architecture", [
 ], ref_cfg, ref_name)
 
 # %% [markdown]
-# OBS_C
+# **Group C observations.** Validation macro F1 rises to 0.8378 for (128, 64), 0.8773 for (256, 128),
+# 0.8471 for (128, 64, 32), and 0.8811 for (256, 128, 64). The last architecture is selected.
+# The gains support the baseline-underfitting diagnosis: additional capacity captures relationships that
+# the small network misses. Its training/validation accuracy gap grows to 1.13 percentage points, so capacity
+# also increases overfitting risk. Width and depth interact; these candidates are architecture comparisons.
 
 # %% [markdown]
 # ### 6.5 Group D: weight initialisation
@@ -901,7 +915,11 @@ ref_cfg, ref_name = run_group("D Initialisation", [
 ], ref_cfg, ref_name)
 
 # %% [markdown]
-# OBS_D
+# **Group D observations.** Xavier reaches validation macro F1 0.8824 versus He's 0.8811, PyTorch default's
+# 0.8764 and small-normal initialization's 0.8690. Xavier becomes the reference under the predefined F1 rule,
+# even though its validation accuracy (92.51%) is below He's (92.79%). This illustrates why selection follows
+# macro F1 rather than accuracy. Xavier is a natural match for tanh, but the 0.0013 gain over He needs
+# confirmation across seeds; the initialization result is not statistically established by this single run.
 
 # %% [markdown]
 # ### 6.6 Group E: learning rate and learning-rate schedules
@@ -916,7 +934,11 @@ ref_cfg, ref_name = run_group("E Learning rate", [
 ], ref_cfg, ref_name)
 
 # %% [markdown]
-# OBS_E
+# **Group E observations.** One-cycle with maximum learning rate 0.003 achieves validation macro F1 0.9005,
+# ahead of the 0.001 constant-rate reference (0.8824), constant 0.003 (0.8767), constant 0.0003 (0.8253),
+# and cosine (0.8745). Plateau matches the reference (0.8824); its logged behavior provides no improvement
+# at this budget. The one-cycle/rate bundle is selected. Warming up and annealing plausibly improves the
+# optimization trajectory; comparing it directly with constant 0.003 also supports a scheduling benefit.
 
 # %% [markdown]
 # ### 6.7 Group F: batch size and number of epochs
@@ -931,7 +953,12 @@ ref_cfg, ref_name = run_group("F Batch size & epochs", [
 ], ref_cfg, ref_name)
 
 # %% [markdown]
-# OBS_F
+# **Group F observations.** At 20 epochs, batch 256 gives validation macro F1 0.9085, versus batch 512's
+# 0.9005, batch 1024's 0.8913 and batch 2048's 0.8723. Smaller batches make more gradient updates per epoch,
+# so these are comparisons at fixed passes through the data, not equal optimizer-step budgets.
+# Training for 10 epochs gives 0.8764; 40 epochs at batch 512 gives the group's best F1, 0.9216.
+# The 40-epoch configuration becomes the reference. With one-cycle, changing epochs also stretches the
+# learning-rate schedule. Its 2.08-point train/validation accuracy gap motivates regularization tests.
 
 # %% [markdown]
 # ### 6.8 Group G: regularisation (Dropout, L2, L1, Batch Normalisation)
@@ -953,7 +980,12 @@ ref_cfg, ref_name = run_group("G Regularisation", [
 ], ref_cfg, ref_name)
 
 # %% [markdown]
-# OBS_G
+# **Group G observations.** BatchNorm improves validation macro F1 from 0.9216 to 0.9294 and reduces the
+# accuracy gap from 2.08 to 1.83 percentage points. It becomes the reference. Dropout 0.1/0.3 scores
+# 0.8742/0.7941; L2 at 0.001 scores 0.7448; L1 at 0.00001 scores 0.9165; BatchNorm plus Dropout 0.1 scores
+# 0.8970. Stronger regularization narrows gaps but can underfit: a smaller gap alone is not success.
+# At these tested strengths it reduces validation performance. BatchNorm's normalization may stabilize
+# optimization. The combination candidate changes two settings relative to the no-BatchNorm reference.
 
 # %% [markdown]
 # ### 6.9 Group H: class-imbalance handling
@@ -965,14 +997,18 @@ ref_cfg, ref_name = run_group("H Class imbalance", [
 ], ref_cfg, ref_name)
 
 # %% [markdown]
-# OBS_H
+# **Group H observations.** Balanced weighting raises validation macro recall from 0.9224 to 0.9537, but
+# lowers macro precision from 0.9368 to 0.8597 and F1 from 0.9294 to 0.9006. Square-root weights produce
+# precision 0.9083, recall 0.9478 and F1 0.9268. Weighting trades more minority-class detections for false
+# positives. Neither beats the unweighted BatchNorm reference on the chosen macro F1 objective, so class
+# weights stay off. A recall-focused application could reasonably choose a different operating objective.
 
 # %% [markdown]
 # ## 7. Final model: longer training with early stopping
 # The screening runs above used a fixed, short budget (20 epochs for most runs) so many configurations could be
 # compared fairly. The best configuration is now trained for up to **60 epochs**, once with a fixed number of
 # epochs and once with **early stopping** (patience 8 on the validation loss, restoring the best weights).
-# The early-stopped model is the candidate final model; the fixed-length run shows what happens without it.
+# Both are candidates; validation macro F1 decides which is selected, including the option without early stopping.
 
 # %%
 print("Best configuration from the fine-tuning search:", ref_name)
@@ -983,8 +1019,7 @@ final_candidates = [
     ("I1_final_60ep_no_es", dict(epochs=60, early_stopping=False)),
     ("I2_final_60ep_early_stopping", dict(epochs=60, early_stopping=True, patience=8)),
 ]
-outs = Parallel(n_jobs=2, backend="loky")(
-    delayed(run_experiment)(name, "I Early stopping", ch, ref_cfg, DATA) for name, ch in final_candidates)
+outs = run_candidates("I Early stopping", final_candidates, ref_cfg, 2)
 final_states = {}
 for row, hist, cfg, state in outs:
     RESULTS.append(row); HISTORIES[row["exp"]] = hist; CONFIGS[row["exp"]] = cfg; final_states[row["exp"]] = state
@@ -997,7 +1032,13 @@ for name, _ in final_candidates:
                  best_epoch=r["best_epoch"] if r["early_stopping"] else None)
 
 # %% [markdown]
-# OBS_I
+# **Group I observations.** Both candidates run all 60 epochs: patience 8 is never exhausted, so early stopping
+# does not save training time in this run. The lowest validation loss is recorded at epoch 59; the enabled
+# candidate restores that checkpoint. The fixed-length candidate retains epoch 60, obtaining validation macro
+# F1 0.931955 versus 0.931673 for the restored candidate. It is selected because F1, rather than minimum loss,
+# is the model-selection objective. The difference is small and does not show that early stopping is harmful.
+# These curves show continued convergence with a modest generalization gap, not a demonstrated early-stop
+# reduction in overfitting. A larger epoch budget or repeated seeds could evaluate that question further.
 
 # %% [markdown]
 # ### 7.1 Final model selection
@@ -1021,9 +1062,10 @@ print("Selected final model:", FINAL_NAME)
 print(final_model)
 print("Trainable parameters:", sum(p.numel() for p in final_model.parameters()))
 
-torch.save({"state_dict": final_model.state_dict(), "config": FINAL_CFG, "features": FEATURES,
-            "cont_cols": CONT_COLS, "scaler_mean": scaler.mean_, "scaler_scale": scaler.scale_,
-            "clip_low": LOW.values, "clip_high": HIGH.values, "class_names": LABELS},
+torch.save({"format_version": 2, "state_dict": final_model.state_dict(), "config": FINAL_CFG,
+            "features": FEATURES, "cont_cols": CONT_COLS, "imputer_median": TRAIN_MEDIANS.tolist(),
+            "scaler_mean": scaler.mean_.tolist(), "scaler_scale": scaler.scale_.tolist(),
+            "clip_low": LOW.tolist(), "clip_high": HIGH.tolist(), "class_names": LABELS},
            "models/final_mlp.pt")
 print("Saved to models/final_mlp.pt")
 
@@ -1148,4 +1190,37 @@ for ax in axes:
 plt.tight_layout(); plt.savefig("figures/baseline_vs_final_curves.png"); plt.show()
 
 # %% [markdown]
-# OBS_FINAL
+# ## 10. Conclusions, limitations, and future improvements
+# ### 10.1 Final selection and separate test results
+# Across 36 experiments, I1_final_60ep_no_es has the highest validation macro F1 (0.931955), with validation
+# accuracy 95.84%. Its 56 -> 256 -> 128 -> 64 -> 7 architecture uses tanh, Xavier initialization, BatchNorm,
+# Adam, one-cycle maximum learning rate 0.003, batch 512 and 60 epochs; Dropout, L1/L2 and class weights are off.
+# Selection uses validation only. The held-out test set then gives accuracy 95.92%, macro precision 0.9363,
+# macro recall 0.9298, macro F1 0.9330, weighted F1 0.9592 and macro one-vs-rest ROC-AUC 0.9981.
+# The baseline test accuracy is 75.90% and macro F1 is 0.5188: improvements of 20.02 percentage points in
+# accuracy and 0.4142 in macro F1. Test results describe the selected model; they did not determine its settings.
+#
+# ### 10.2 Generalization and class-level errors
+# Final training accuracy/F1 are 98.02%/0.9707, versus validation 95.84%/0.9320. The 2.18-point accuracy gap
+# indicates some overfitting, although validation and test are close. The small baseline gap plus low scores
+# was underfitting; adding capacity, optimization changes and longer training was more useful than strong
+# regularization. Loss and accuracy curves should be read together with minority-class F1, not in isolation.
+# On test, Cottonwood/Willow F1 is 0.8761 (412 samples) and Aspen F1 is 0.8880 (1,424 samples), below the other
+# classes (0.9237-0.9656). High overall accuracy and AUC therefore do not imply uniform class performance.
+#
+# ### 10.3 Limitations
+# * One split and seed do not measure run-to-run uncertainty; tiny F1 differences may be noise.
+# * Greedy group-wise tuning misses interactions, and many comparisons on one validation set can overfit it.
+# * Several candidates bundle settings; the observed gains cannot always be assigned to one change.
+# * Random splits of geographically related cells may be optimistic for new regions. The dataset is limited
+#   to four wilderness areas in northern Colorado; this is an educational model, not a validated field system.
+# * Clipping can discard useful extreme-terrain information; missing-value behavior is a fallback that has
+#   not been evaluated on naturally missing measurements because the source dataset is complete.
+#
+# ### 10.4 Future improvements and reuse
+# Repeat promising configurations over several seeds and report uncertainty; consider spatial/grouped validation
+# when suitable location identifiers are available. Test finer regularization strengths, interactions and
+# non-neural tabular baselines within the training/validation process. Evaluate calibration if probabilities
+# will inform decisions. Preserve the final test split from further tuning, and use new held-out data for a
+# later iteration. The saved checkpoint includes fitted medians, clipping and scaling statistics;
+# `python predict.py examples/sample_input.csv` demonstrates inference without retraining or downloading data.
